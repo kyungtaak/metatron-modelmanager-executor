@@ -91,6 +91,10 @@ public class ExecutorProperties {
     return functionProp.get("function.outputPath");
   }
 
+  public String getBinaryPath() {
+    return functionProp.get("function.binaryPath");
+  }
+
   public String getWorkingDir() {
     return functionProp.get("function.workingDir");
   }

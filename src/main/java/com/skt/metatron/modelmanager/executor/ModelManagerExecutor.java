@@ -1,5 +1,7 @@
 package com.skt.metatron.modelmanager.executor;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.skt.metatron.modelmanager.executor.exception.ExecutorException;
@@ -14,16 +16,15 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.SparkContext;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.rdd.RDD;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.SQLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.PrintWriter;
+import java.io.*;
 import java.lang.reflect.InvocationTargetException;
 import java.net.URI;
 import java.util.ArrayList;
@@ -62,10 +63,16 @@ public class ModelManagerExecutor {
 
       // 1. Create SparkContext
       SparkContext sparkContext = new SparkContext(properties.getSparkConf());
+      String binaryPath = properties.getBinaryPath();
+      if(StringUtils.isNotEmpty(binaryPath)) {
+        sparkContext.addJar(binaryPath);
+      }
+
       String checkpointDir = properties.getCheckPointDir();
       if(StringUtils.isNotEmpty(checkpointDir)) {
         sparkContext.setCheckpointDir(checkpointDir);
       }
+
       SQLContext sqlContext = new SQLContext(sparkContext);
       LOGGER.info("Successfully created sparkcontext.");
 
@@ -77,11 +84,25 @@ public class ModelManagerExecutor {
       // 2. Load TargetDataFrames
       List<String> paths = properties.getDataPaths();
       List<DataFrame> mainDataFrames = new ArrayList<>();
+
+      ObjectMapper mapper = new ObjectMapper();
       for (String path : paths) {
-        String filePath = processDataFile(path, hdfs);
+        File original = new File(path);
+        JsonNode jsonNode = mapper.readValue(original, JsonNode.class);
+        File newFile = new File(original.getAbsolutePath() + "_new");
+
+        FileWriter fw = new FileWriter(newFile);
+        for(JsonNode node : jsonNode) {
+          fw.write(mapper.writeValueAsString(node) + "\n");
+        }
+        fw.close();
+
+        String filePath = processDataFile(newFile.getAbsolutePath(), hdfs);
         LOGGER.info("Target Data File : {}", filePath);
         DataFrame df = sqlContext.read().json(filePath);
+        System.out.println("Main-----");
         df.printSchema();
+        //df = df.select("chamberId", "lotId", "paramName", "procId", "recipeId", "stepId", "timestamp", "waferId").where("_corrupt_record != '[' and _corrupt_record != ']");
         mainDataFrames.add(df);
       }
       LOGGER.info("Successfully load main dataframe.");
@@ -104,9 +125,11 @@ public class ModelManagerExecutor {
               properties.getArgs()
       );
 
-      createOutputFile(result, properties.getOutputFormat(), properties.getOutputPath());
-      LOGGER.info("Successfully create output");
-
+      if(!sparkContext.isStopped()){
+        createOutputFile(result, properties.getOutputFormat(), properties.getOutputPath());
+        LOGGER.info("Successfully create output");
+      }else
+        LOGGER.error("Failure - You must not stop SparkContext");
     } catch (Exception e) {
       LOGGER.error("Executor Error: {}", e.getMessage());
       e.printStackTrace();
@@ -257,20 +280,25 @@ public class ModelManagerExecutor {
 
     SerializableStringJoiner joiner = new SerializableStringJoiner(",", "[", "]");
 
-    Object resultRdd = null;
     try {
-      resultRdd = output.select(columns.toArray(new Column[columns.size()])).toJSON().toArray();
+
+      System.out.println("Selected Result -----");
+      DataFrame resultDf = output.select(columns.toArray(new Column[columns.size()]));
+      resultDf.printSchema();
+      //resultDf.show();
+
+      JavaRDD<String> resultRdd = resultDf.toJSON().toJavaRDD();
+
+      if (resultRdd != null) {
+        List<String> rdds = resultRdd.collect();
+        for (String rdd : rdds) {
+          joiner.add(rdd);
+        }
+      }
     } catch (Exception e) {
       // 지정한 칼럼과 결과 데이터 프레임의 결과가 맞지 않는 경우 발생 Case.
       LOGGER.error("Fail to get output from DataFrame : {}", e.getMessage());
       throw new ExecutorException("Fail to get output from DataFrame : " + e.getMessage());
-    }
-
-    if (resultRdd != null) {
-      String[] strArray = (String[]) resultRdd;
-      for (String object : strArray) {
-        joiner.add(object);
-      }
     }
 
     try (PrintWriter out = new PrintWriter(outputPath)) {
