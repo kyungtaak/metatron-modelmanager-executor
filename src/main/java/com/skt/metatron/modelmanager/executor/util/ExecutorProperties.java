@@ -83,6 +83,10 @@ public class ExecutorProperties {
     return functionProp.get("function.invokeType");
   }
 
+  public String getDataType() {
+    return functionProp.get("function.dataType");
+  }
+
   public String getOutputFormat() {
     return functionProp.get("function.outputFormat");
   }

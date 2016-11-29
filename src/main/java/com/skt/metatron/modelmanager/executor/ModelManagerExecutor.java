@@ -1,30 +1,31 @@
 package com.skt.metatron.modelmanager.executor;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+
 import com.skt.metatron.modelmanager.executor.exception.ExecutorException;
+import com.skt.metatron.modelmanager.executor.util.ConvertJsonForDataFrame;
 import com.skt.metatron.modelmanager.executor.util.ExecutorProperties;
 import com.skt.metatron.modelmanager.executor.util.SerializableStringJoiner;
-import org.apache.commons.io.FileUtils;
+
 import org.apache.commons.lang3.ClassUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.reflect.ConstructorUtils;
 import org.apache.commons.lang3.reflect.MethodUtils;
 import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.FsStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.rdd.RDD;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.SQLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.lang.reflect.InvocationTargetException;
 import java.net.URI;
 import java.util.ArrayList;
@@ -60,16 +61,15 @@ public class ModelManagerExecutor {
         }
       });
 
-
       // 1. Create SparkContext
       SparkContext sparkContext = new SparkContext(properties.getSparkConf());
       String binaryPath = properties.getBinaryPath();
-      if(StringUtils.isNotEmpty(binaryPath)) {
+      if (StringUtils.isNotEmpty(binaryPath)) {
         sparkContext.addJar(binaryPath);
       }
 
       String checkpointDir = properties.getCheckPointDir();
-      if(StringUtils.isNotEmpty(checkpointDir)) {
+      if (StringUtils.isNotEmpty(checkpointDir)) {
         sparkContext.setCheckpointDir(checkpointDir);
       }
 
@@ -77,7 +77,7 @@ public class ModelManagerExecutor {
       LOGGER.info("Successfully created sparkcontext.");
 
       FileSystem hdfs = null;
-      if(properties.getMaster().indexOf("yarn") > -1) {
+      if (properties.getMaster().indexOf("yarn") > -1) {
         hdfs = FileSystem.get(properties.getHadoopConf());
       }
 
@@ -85,24 +85,38 @@ public class ModelManagerExecutor {
       List<String> paths = properties.getDataPaths();
       List<DataFrame> mainDataFrames = new ArrayList<>();
 
-      ObjectMapper mapper = new ObjectMapper();
       for (String path : paths) {
         File original = new File(path);
-        JsonNode jsonNode = mapper.readValue(original, JsonNode.class);
-        File newFile = new File(original.getAbsolutePath() + "_new");
 
-        FileWriter fw = new FileWriter(newFile);
-        for(JsonNode node : jsonNode) {
-          fw.write(mapper.writeValueAsString(node) + "\n");
+        DataFrame df = null;
+        String filePath = null;
+        switch (properties.getDataType()) {
+          case "JSON":
+            String convertedPath = ConvertJsonForDataFrame.convert(original.getAbsolutePath());
+            filePath = processDataFile(convertedPath, hdfs);
+            df = sqlContext.read().json(filePath);
+            break;
+          case "CSV":
+            filePath = processDataFile(original.getAbsolutePath(), hdfs);
+            df = sqlContext.read()
+                .format("com.databricks.spark.csv")
+                .option("header", "true")
+                .option("inferSchema", "true")
+                .load(filePath);
+            break;
+          case "ORC":
+            filePath = processDataFile(original.getAbsolutePath(), hdfs);
+            df = sqlContext.read().orc(filePath);
+            break;
         }
-        fw.close();
 
-        String filePath = processDataFile(newFile.getAbsolutePath(), hdfs);
-        LOGGER.info("Target Data File : {}", filePath);
-        DataFrame df = sqlContext.read().json(filePath);
-        System.out.println("Main-----");
-        df.printSchema();
-        //df = df.select("chamberId", "lotId", "paramName", "procId", "recipeId", "stepId", "timestamp", "waferId").where("_corrupt_record != '[' and _corrupt_record != ']");
+        LOGGER.info("Main-----");
+        if (LOGGER.isInfoEnabled()) {
+          df.printSchema();
+        }
+        if (LOGGER.isInfoEnabled()) {
+          df.show(100);
+        }
         mainDataFrames.add(df);
       }
       LOGGER.info("Successfully load main dataframe.");
@@ -119,17 +133,18 @@ public class ModelManagerExecutor {
 
       // 2. Run Invoke
       DataFrame result = invokeJob(sparkContext,
-              properties,
-              mainDataFrames.toArray(new DataFrame[mainDataFrames.size()]),
-              modelDataFrame,
-              properties.getArgs()
+          properties,
+          mainDataFrames.toArray(new DataFrame[mainDataFrames.size()]),
+          modelDataFrame,
+          properties.getArgs()
       );
 
-      if(!sparkContext.isStopped()){
+      if (!sparkContext.isStopped()) {
         createOutputFile(result, properties.getOutputFormat(), properties.getOutputPath());
         LOGGER.info("Successfully create output");
-      }else
+      } else {
         LOGGER.error("Failure - You must not stop SparkContext");
+      }
     } catch (Exception e) {
       LOGGER.error("Executor Error: {}", e.getMessage());
       e.printStackTrace();
@@ -141,17 +156,17 @@ public class ModelManagerExecutor {
   public static String processDataFile(String path, FileSystem hdfs) {
 
     LOGGER.info("HDFS object : " + hdfs);
-    if(hdfs == null) {
+    if (hdfs == null) {
       return path;
     }
 
     URI uri = URI.create(path);
-    if("hdfs".equals(uri.getScheme())) {
+    if ("hdfs".equals(uri.getScheme())) {
       return path;
     }
 
-    System.out.println("path : " + path);
-    System.out.println("URI : " + uri.toString());
+    LOGGER.info("path : {}", path);
+    LOGGER.info("URI : {}", uri.toString());
     Path localPath = new Path(path);
     Path hdfsPath = new Path("/tmp/" + localPath.getName());
 
@@ -160,7 +175,7 @@ public class ModelManagerExecutor {
     } catch (IOException e) {
       throw new ExecutorException("Fail to copy to HDFS : " + e.getMessage());
     }
-    System.out.println("HDFS URI : " + hdfsPath.toUri());
+    LOGGER.info("HDFS URI : {}", hdfsPath.toUri());
 
     return "hdfs://" + hdfsPath.toUri().toString();
   }
@@ -202,7 +217,7 @@ public class ModelManagerExecutor {
     try {
       // List 형식의 데이터를 가변인자로 전환시 toArray 메소드 적용, Size 지정 필수
       Object result = MethodUtils.invokeMethod(serviceObj, properties.getMethodName()
-              , invokeArgs.toArray(new Object[invokeArgs.size()]));
+          , invokeArgs.toArray(new Object[invokeArgs.size()]));
       resultDataFrame = (result == null) ? null : (DataFrame) result;
     } catch (NoSuchMethodException | IllegalAccessException e) {
       LOGGER.error("Fail to invoke method({}) : {}", properties.getMethodName(), e.getMessage());
